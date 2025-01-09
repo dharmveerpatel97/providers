@@ -1,0 +1,352 @@
+import { TextDecoder, TextEncoder } from 'text-encoding';
+import NetInfo from "@react-native-community/netinfo";
+
+class SocketProvider {
+    websocket = null;
+    listeners = {};
+    messageQueue = [];
+    isReconnecting = false;
+    connectionTimeout = null;
+
+    constructor() {
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        this.reconnectDelay = 1000;
+        this.maxReconnectDelay = 30000;
+        this.connectionTimeoutDuration = 10000;
+        this.maxQueueSize = 100; // Limit for the message queue
+        this.logLevel = "info"; // Log level: "debug", "info", "warn", "error"
+    }
+
+    log = (level, ...args) => {
+        const levels = ["debug", "info", "warn", "error"];
+        if (levels.indexOf(level) >= levels.indexOf(this.logLevel)) {
+            console[level](...args);
+        }
+    };
+
+    register = (eventName, callback) => {
+        if (!this.listeners[eventName]) {
+            this.listeners[eventName] = [];
+        }
+        this.listeners[eventName].push(callback);
+        if (this.websocket) {
+            this.addWebSocketListener(eventName, callback);
+        }
+    };
+
+    unregister = (eventName, callback) => {
+        if (this.listeners[eventName]) {
+            this.listeners[eventName] = this.listeners[eventName].filter(cb => cb !== callback);
+            if (this.websocket) {
+                this.removeWebSocketListener(eventName, callback);
+            }
+        }
+    };
+
+    addWebSocketListener = (eventName, callback) => {
+        if (this.websocket) {
+            this.websocket[`on${eventName}`] = (evt) => {
+                this.log("debug", `WebSocket event: ${eventName}`, evt);
+                callback(evt);
+            };
+        }
+    };
+
+    removeWebSocketListener = (eventName) => {
+        if (this.websocket) {
+            this.websocket[`on${eventName}`] = null;
+        }
+    };
+
+    connect = async (authToken) => {
+        if (!authToken) {
+            this.log("error", "Auth token is required to connect.");
+            return;
+        }
+
+        if (this.websocket || this.isReconnecting) {
+            this.log("info", "WebSocket is already connecting/connected.");
+            return;
+        }
+
+        try {
+            const netInfo = await NetInfo.fetch();
+            if (!netInfo.isConnected) {
+                this.log("warn", "No internet connection. Cannot connect.");
+                return;
+            }
+        } catch (error) {
+            this.log("error", "Error fetching network info:", error);
+            return;
+        }
+
+        this.isReconnecting = true;
+        const url = `https://emob.miraie.in/ws/v1/connect?auth=${authToken}`;
+        this.log("info", "Connecting to WebSocket:", url);
+
+        try {
+            this.websocket = new WebSocket(url);
+            this.websocket.binaryType = 'arraybuffer';
+
+            this.connectionTimeout = setTimeout(() => {
+                if (this.websocket && this.websocket.readyState !== WebSocket.OPEN) {
+                    this.log("warn", "WebSocket connection timeout.");
+                    this.websocket.close();
+                    this.reconnect();
+                }
+            }, this.connectionTimeoutDuration);
+
+            this.websocket.onopen = () => {
+                clearTimeout(this.connectionTimeout);
+                this.log("info", "WebSocket connected");
+                this.reconnectAttempts = 0;
+                this.reconnectDelay = 1000;
+                this.isReconnecting = false;
+                this.sendQueuedMessages();
+                this.triggerListeners('open');
+            };
+
+            this.websocket.onmessage = (evt) => {
+                this.log("debug", "WebSocket message received:", evt);
+                this.triggerListeners('message', evt);
+            };
+
+            this.websocket.onerror = (error) => {
+                clearTimeout(this.connectionTimeout);
+                this.log("error", "WebSocket error:", error);
+                this.triggerListeners('error', error);
+                this.websocket = null;
+                this.isReconnecting = false;
+                this.reconnect();
+            };
+
+            this.websocket.onclose = (evt) => {
+                clearTimeout(this.connectionTimeout);
+                this.log("warn", "WebSocket closed:", evt);
+                this.websocket = null;
+                this.isReconnecting = false;
+                this.triggerListeners('close', evt);
+                this.reconnect();
+            };
+
+            Object.keys(this.listeners).forEach(eventName => {
+                this.listeners[eventName].forEach(callback => {
+                    this.addWebSocketListener(eventName, callback);
+                });
+            });
+        } catch (error) {
+            this.log("error", "Error during WebSocket creation:", error);
+            this.isReconnecting = false;
+            this.reconnect();
+        }
+    };
+
+    disconnect = () => {
+        if (this.websocket) {
+            this.log("info", "Disconnecting WebSocket");
+            this.websocket.close();
+            this.websocket = null;
+            this.messageQueue = [];
+            clearTimeout(this.connectionTimeout);
+            this.isReconnecting = false;
+            this.reconnectAttempts = 0;
+            this.reconnectDelay = 1000;
+        }
+    };
+
+    sendMessage = (msg) => {
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+            try {
+                const encoder = new TextEncoder();
+                const encodedMessage = encoder.encode(JSON.stringify(msg));
+                this.websocket.send(encodedMessage);
+                this.log("info", "WebSocket message sent:", msg);
+            } catch (error) {
+                this.log("error", "Error sending WebSocket message:", error);
+                this.triggerListeners('error', error);
+            }
+        } else {
+            if (this.messageQueue.length >= this.maxQueueSize) {
+                this.log("warn", "Message queue is full. Dropping the oldest message.");
+                this.messageQueue.shift();
+            }
+            this.log("warn", "WebSocket is not open. Queueing message:", msg);
+            this.messageQueue.push(msg);
+        }
+    };
+
+    sendQueuedMessages = () => {
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN && this.messageQueue.length > 0) {
+            this.log("info", "Sending queued messages");
+            this.messageQueue.forEach(msg => this.sendMessage(msg));
+            this.messageQueue = [];
+        }
+    };
+
+    reconnect = async () => {
+        if (this.isReconnecting) {
+            this.log("info", "Reconnection already in progress.");
+            return;
+        }
+
+        try {
+            const netInfo = await NetInfo.fetch();
+            if (!netInfo.isConnected) {
+                this.log("warn", "No internet connection. Cancelling reconnection attempts.");
+                this.reconnectAttempts = 0;
+                this.reconnectDelay = 1000;
+                return;
+            }
+        } catch (error) {
+            this.log("error", "Error fetching network info during reconnection:", error);
+            return;
+        }
+
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.isReconnecting = true;
+            this.reconnectAttempts++;
+            const jitter = Math.random() * Math.min(this.reconnectDelay, this.maxReconnectDelay);
+            const delayWithJitter = Math.min(this.reconnectDelay + jitter, this.maxReconnectDelay);
+            this.log("info", `Reconnecting WebSocket in ${delayWithJitter / 1000} seconds (Attempt ${this.reconnectAttempts})...`);
+            setTimeout(() => {
+                this.connect();
+                this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+                this.isReconnecting = false;
+            }, delayWithJitter);
+        } else {
+            this.log("error", "Max reconnection attempts reached. Please check your network connection.");
+            this.triggerListeners('error', new Error("Max reconnection attempts reached"));
+            this.reconnectAttempts = 0;
+            this.reconnectDelay = 1000;
+            this.isReconnecting = false;
+        }
+    };
+
+    triggerListeners = (eventName, ...args) => {
+        if (this.listeners[eventName]) {
+            this.listeners[eventName].forEach(callback => callback(...args));
+        }
+    };
+
+    getConnectionState = () => {
+        return this.websocket ? this.websocket.readyState : WebSocket.CLOSED;
+    };
+}
+
+const socketPro = new SocketProvider();
+Object.freeze(socketPro);
+export default socketPro;
+
+
+
+
+
+
+
+
+
+
+
+
+//==================================
+import React, { useState, useEffect } from 'react';
+import { View, Text, Button, StyleSheet } from 'react-native';
+import socketPro from './SocketProvider'; // Import your SocketProvider
+import { useDispatch, useSelector } from 'react-redux';
+import { addMessage } from './websocketSlice'; // Import your Redux actions
+
+const MyComponent = () => {
+    const [messageToSend, setMessageToSend] = useState('');
+    const dispatch = useDispatch();
+    const messages = useSelector((state) => state.websocket.messages);
+    const [isConnected, setIsConnected] = useState(false)
+
+    useEffect(() => {
+        const handleOpen = () => {
+            console.log("Socket Opened in component")
+            setIsConnected(true)
+        };
+        const handleMessage = (event) => {
+            try {
+                const decoder = new TextDecoder();
+                const decodedMessage = decoder.decode(event.data);
+                const parsedMessage = JSON.parse(decodedMessage);
+                dispatch(addMessage(parsedMessage));
+            } catch (error) {
+                console.error("Error parsing message:", error);
+            }
+        };
+
+        const handleError = (error) => {
+            console.error("Socket Error in component", error)
+            setIsConnected(false)
+        }
+
+        const handleClose = () => {
+            console.log("Socket Closed in component")
+            setIsConnected(false)
+        }
+
+        socketPro.register('open', handleOpen);
+        socketPro.register('message', handleMessage);
+        socketPro.register('error', handleError)
+        socketPro.register('close', handleClose)
+
+        return () => {
+            socketPro.  ('open', handleOpen);
+            socketPro.unregister('message', handleMessage);
+            socketPro.unregister('error', handleError)
+            socketPro.unregister('close', handleClose)
+        };
+    }, [dispatch]);
+
+    const connectWebSocket = async () => {
+        const authToken = 'YOUR_AUTH_TOKEN'; // Replace with your actual auth token
+        await socketPro.connect(authToken);
+    };
+
+    const disconnectWebSocket = () => {
+        socketPro.disconnect();
+    };
+
+    const sendMessage = () => {
+        if (messageToSend) {
+            socketPro.sendMessage({ type: 'chat_message', message: messageToSend });
+            setMessageToSend('')
+        }
+    };
+
+    return (
+        <View style={styles.container}>
+            <Button title="Connect WebSocket" onPress={connectWebSocket} disabled={isConnected} />
+            <Button title="Disconnect WebSocket" onPress={disconnectWebSocket} disabled={!isConnected} />
+            <TextInput
+                style={styles.input}
+                placeholder="Enter message"
+                value={messageToSend}
+                onChangeText={setMessageToSend}
+            />
+            <Button title="Send Message" onPress={sendMessage} disabled={!isConnected} />
+            {messages.map((msg, index) => (
+                <Text key={index}>{JSON.stringify(msg)}</Text>
+            ))}
+        </View>
+    );
+};
+
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+        padding: 20,
+    },
+    input: {
+        height: 40,
+        borderColor: 'gray',
+        borderWidth: 1,
+        marginBottom: 10,
+        paddingHorizontal: 10,
+    },
+});
+
+export default MyComponent;
