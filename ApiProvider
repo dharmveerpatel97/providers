@@ -1,0 +1,182 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import axios from 'axios';
+
+class ApiCallProvider {
+  constructor(apiBaseUrl, refreshTokenEndpoint = '/refresh') {
+    this.apiBaseUrl = apiBaseUrl;
+    this.refreshTokenEndpoint = refreshTokenEndpoint;
+    this.accessToken = null;
+    this.refreshToken = null;
+    this.isRefreshing = false; // Flag to prevent concurrent refresh requests
+    this.loadStoredTokens();
+  }
+
+  async loadStoredTokens() {
+    try {
+      this.accessToken = await AsyncStorage.getItem('accessToken');
+      this.refreshToken = await AsyncStorage.getItem('refreshToken');
+    } catch (error) {
+      console.error('Error loading stored tokens:', error);
+    }
+  }
+
+  async storeTokens(accessToken, refreshToken) {
+    try {
+      await AsyncStorage.setItem('accessToken', accessToken);
+      await AsyncStorage.setItem('refreshToken', refreshToken);
+      this.accessToken = accessToken;
+      this.refreshToken = refreshToken;
+    } catch (error) {
+      console.error('Error storing tokens:', error);
+    }
+  }
+
+  async clearTokens() {
+    try {
+      await AsyncStorage.removeItem('accessToken');
+      await AsyncStorage.removeItem('refreshToken');
+      this.accessToken = null;
+      this.refreshToken = null;
+    } catch (error) {
+      console.error('Error clearing tokens:', error);
+    }
+  }
+
+  async refreshAccessToken() {
+    if (this.isRefreshing) {
+      return null; // Already refreshing, prevent concurrent requests
+    }
+
+    this.isRefreshing = true;
+    try {
+      if (!this.refreshToken) {
+        return null; // No refresh token available
+      }
+
+      const response = await axios.post(this.apiBaseUrl + this.refreshTokenEndpoint, {
+        refreshToken: this.refreshToken,
+      });
+
+      if (response.status === 200) {
+        const newAccessToken = response.data.accessToken;
+        const newRefreshToken = response.data.refreshToken || this.refreshToken;
+        await this.storeTokens(newAccessToken, newRefreshToken);
+        return newAccessToken;
+      } else {
+        await this.clearTokens();
+        return null;
+      }
+    } catch (error) {
+      console.error('Error refreshing access token:', error);
+      if (error.response?.status === 401) {
+        await this.clearTokens();
+      }
+      return null;
+    } finally {
+      this.isRefreshing = false;
+    }
+  }
+
+  async call(method, url, data = null, additionalHeaders = {}) {
+    let headers = { ...additionalHeaders };
+    if (this.accessToken) {
+      headers.Authorization = `Bearer ${this.accessToken}`;
+    }
+
+    try {
+      let response = await axios({
+        method,
+        url: this.apiBaseUrl + url,
+        data,
+        headers,
+      });
+      return response;
+    } catch (error) {
+      if (error.response?.status === 401 && !error.config._retry) {
+        error.config._retry = true;
+        const newAccessToken = await this.refreshAccessToken();
+        if (newAccessToken) {
+          error.config.headers.Authorization = `Bearer ${newAccessToken}`;
+          return this.call(method, url, data, additionalHeaders); // Retry the original request
+        } else {
+          // Handle refresh token failure (e.g., redirect to login)
+          throw error; // Re-throw the error after clearing tokens
+        }
+      }
+      throw error; // Re-throw other errors
+    }
+  }
+
+  async login(accessToken, refreshToken) {
+    await this.storeTokens(accessToken, refreshToken);
+  }
+
+  async logout() {
+    await this.clearTokens();
+  }
+}
+
+export default ApiCallProvider;.
+// Create and export the instance:
+const apiCallProviderInstance = new ApiCallProvider(); // You can pass refreshTokenEndpoint and refreshBeforeExpirationSeconds here if needed.
+Object.freeze(apiCallProviderInstance); // Freeze the instance to prevent accidental modifications
+
+export default apiCallProviderInstance; // Export the instance
+export { ApiCallProvider }; // Also export the class itself if needed for testing or customization
+
+
+
+
+// How to use it in a component:
+
+import React, { useState, useEffect } from 'react';
+import { View, Text, Button } from 'react-native';
+import apiCallProviderInstance,{ApiCallProvider} from './ApiCallProvider';
+
+const MyComponent = () => {
+  const [data, setData] = useState(null)
+  const apiProvider = new ApiCallProvider('YOUR_API_BASE_URL'); // Initialize ONCE
+
+  const handleLogin = async () => {
+    try {
+        const response = await axios.post("YOUR_LOGIN_ENDPOINT", {username: "username", password: "password"})
+        if(response.status === 200){
+          const {accessToken, refreshToken} = response.data
+          apiProvider.login(accessToken, refreshToken);
+        }
+      } catch (error) {
+        console.log("Login error", error)
+      }
+  };
+
+  const handleLogout = async () => {
+    await apiProvider.logout();
+  };
+
+  const makeProtectedRequest = async () => {
+    try {
+      const response = await apiProvider.call('get', '/protected-route');
+      setData(response.data)
+      console.log('Protected request response:', response.data);
+    } catch (error) {
+      console.error('Protected request error:', error);
+    }
+  };
+
+  return (
+    <View>
+      {apiProvider.accessToken ? (
+        <View>
+          <Text>Logged in. Access Token: {apiProvider.accessToken}</Text>
+          <Button title="Logout" onPress={handleLogout} />
+          <Button title="Make Protected Request" onPress={makeProtectedRequest} />
+          {data && <Text>{JSON.stringify(data)}</Text>}
+        </View>
+      ) : (
+        <Button title="Login" onPress={handleLogin} />
+      )}
+    </View>
+  );
+};
+
+export default MyComponent;
