@@ -1,182 +1,224 @@
+import axios, { AxiosInstance, AxiosRequestConfig, AxiosError, Method } from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import axios from 'axios';
 
-class ApiCallProvider {
-  constructor(apiBaseUrl, refreshTokenEndpoint = '/refresh') {
-    this.apiBaseUrl = apiBaseUrl;
-    this.refreshTokenEndpoint = refreshTokenEndpoint;
-    this.accessToken = null;
-    this.refreshToken = null;
-    this.isRefreshing = false; // Flag to prevent concurrent refresh requests
-    this.loadStoredTokens();
-  }
-
-  async loadStoredTokens() {
-    try {
-      this.accessToken = await AsyncStorage.getItem('accessToken');
-      this.refreshToken = await AsyncStorage.getItem('refreshToken');
-    } catch (error) {
-      console.error('Error loading stored tokens:', error);
-    }
-  }
-
-  async storeTokens(accessToken, refreshToken) {
-    try {
-      await AsyncStorage.setItem('accessToken', accessToken);
-      await AsyncStorage.setItem('refreshToken', refreshToken);
-      this.accessToken = accessToken;
-      this.refreshToken = refreshToken;
-    } catch (error) {
-      console.error('Error storing tokens:', error);
-    }
-  }
-
-  async clearTokens() {
-    try {
-      await AsyncStorage.removeItem('accessToken');
-      await AsyncStorage.removeItem('refreshToken');
-      this.accessToken = null;
-      this.refreshToken = null;
-    } catch (error) {
-      console.error('Error clearing tokens:', error);
-    }
-  }
-
-  async refreshAccessToken() {
-    if (this.isRefreshing) {
-      return null; // Already refreshing, prevent concurrent requests
-    }
-
-    this.isRefreshing = true;
-    try {
-      if (!this.refreshToken) {
-        return null; // No refresh token available
-      }
-
-      const response = await axios.post(this.apiBaseUrl + this.refreshTokenEndpoint, {
-        refreshToken: this.refreshToken,
-      });
-
-      if (response.status === 200) {
-        const newAccessToken = response.data.accessToken;
-        const newRefreshToken = response.data.refreshToken || this.refreshToken;
-        await this.storeTokens(newAccessToken, newRefreshToken);
-        return newAccessToken;
-      } else {
-        await this.clearTokens();
-        return null;
-      }
-    } catch (error) {
-      console.error('Error refreshing access token:', error);
-      if (error.response?.status === 401) {
-        await this.clearTokens();
-      }
-      return null;
-    } finally {
-      this.isRefreshing = false;
-    }
-  }
-
-  async call(method, url, data = null, additionalHeaders = {}) {
-    let headers = { ...additionalHeaders };
-    if (this.accessToken) {
-      headers.Authorization = `Bearer ${this.accessToken}`;
-    }
-
-    try {
-      let response = await axios({
-        method,
-        url: this.apiBaseUrl + url,
-        data,
-        headers,
-      });
-      return response;
-    } catch (error) {
-      if (error.response?.status === 401 && !error.config._retry) {
-        error.config._retry = true;
-        const newAccessToken = await this.refreshAccessToken();
-        if (newAccessToken) {
-          error.config.headers.Authorization = `Bearer ${newAccessToken}`;
-          return this.call(method, url, data, additionalHeaders); // Retry the original request
-        } else {
-          // Handle refresh token failure (e.g., redirect to login)
-          throw error; // Re-throw the error after clearing tokens
-        }
-      }
-      throw error; // Re-throw other errors
-    }
-  }
-
-  async login(accessToken, refreshToken) {
-    await this.storeTokens(accessToken, refreshToken);
-  }
-
-  async logout() {
-    await this.clearTokens();
-  }
+// Define the response type
+interface ApiResponse<T> {
+  data: T;
 }
 
-export default ApiCallProvider;.
-// Create and export the instance:
-const apiCallProviderInstance = new ApiCallProvider(); // You can pass refreshTokenEndpoint and refreshBeforeExpirationSeconds here if needed.
-Object.freeze(apiCallProviderInstance); // Freeze the instance to prevent accidental modifications
+// Create Axios instance with base configuration
+const axiosInstance: AxiosInstance = axios.create({
+  baseURL: 'https://your-api-url.com', // Replace with your API base URL
+  timeout: 10000,
+});
 
-export default apiCallProviderInstance; // Export the instance
-export { ApiCallProvider }; // Also export the class itself if needed for testing or customization
+// Request Interceptor
+axiosInstance.interceptors.request.use(
+  async (config: AxiosRequestConfig) => {
+    const token = await AsyncStorage.getItem('accessToken');
+    if (token) {
+      config.headers = {
+        ...config.headers,
+        Authorization: `Bearer ${token}`,
+      };
+    }
+    return config;
+  },
+  (error: AxiosError) => Promise.reject(error)
+);
 
+// Response Interceptor for token refresh
+axiosInstance.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config;
 
+    if (error.response?.status === 401 && !originalRequest?._retry) {
+      originalRequest._retry = true;
 
+      try {
+        const refreshToken = await AsyncStorage.getItem('refreshToken');
+        const response = await axios.post('https://your-api-url.com/auth/refresh', {
+          refreshToken,
+        });
 
-// How to use it in a component:
+        const { accessToken, refreshToken: newRefreshToken } = response.data;
+        await AsyncStorage.setItem('accessToken', accessToken);
+        await AsyncStorage.setItem('refreshToken', newRefreshToken);
 
-import React, { useState, useEffect } from 'react';
-import { View, Text, Button } from 'react-native';
-import apiCallProviderInstance,{ApiCallProvider} from './ApiCallProvider';
-
-const MyComponent = () => {
-  const [data, setData] = useState(null)
-  const apiProvider = new ApiCallProvider('YOUR_API_BASE_URL'); // Initialize ONCE
-
-  const handleLogin = async () => {
-    try {
-        const response = await axios.post("YOUR_LOGIN_ENDPOINT", {username: "username", password: "password"})
-        if(response.status === 200){
-          const {accessToken, refreshToken} = response.data
-          apiProvider.login(accessToken, refreshToken);
-        }
-      } catch (error) {
-        console.log("Login error", error)
+        originalRequest.headers = {
+          ...originalRequest.headers,
+          Authorization: `Bearer ${accessToken}`,
+        };
+        return axiosInstance(originalRequest);
+      } catch (refreshError) {
+        console.error('Token refresh failed:', refreshError);
+        return Promise.reject(refreshError);
       }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+// Centralized Error Handler
+const handleApiError = (error: AxiosError): string => {
+  if (error.response) {
+    console.error('API Error Response:', error.response.data);
+    return (error.response.data as { message?: string })?.message || 'API Error Occurred.';
+  } else if (error.request) {
+    console.error('API No Response Error:', error.request);
+    return 'No response from the server.';
+  } else {
+    console.error('API Request Setup Error:', error.message);
+    return error.message || 'Unknown error occurred.';
+  }
+};
+
+// Reusable API Function with support for multipart/form-data
+export const apiRequest = async <T>(
+  method: Method,
+  endpoint: string,
+  data: any = null,
+  isFile: boolean = false
+): Promise<ApiResponse<T>> => {
+  try {
+    const config: AxiosRequestConfig = {
+      method,
+      url: endpoint,
+      headers: isFile
+        ? { 'Content-Type': 'multipart/form-data' }
+        : { 'Content-Type': 'application/json' },
+      ...(data && { data: isFile ? data : JSON.stringify(data) }),
+    };
+
+    const response = await axiosInstance(config);
+    return response.data;
+  } catch (error) {
+    throw new Error(handleApiError(error as AxiosError));
+  }
+};
+
+export default axiosInstance;
+
+==================================================================
+
+
+import React, { useState } from 'react';
+import {
+  View,
+  Text,
+  Button,
+  StyleSheet,
+  Image,
+  Alert,
+  ActivityIndicator,
+} from 'react-native';
+import { launchImageLibrary, Asset } from 'react-native-image-picker';
+import { apiRequest } from './apiService';
+
+// Define the upload response type
+interface UploadResponse {
+  message: string;
+  file: {
+    path: string;
+    size: number;
+    type: string;
+    filename: string;
+  };
+}
+
+const App: React.FC = () => {
+  const [imageUri, setImageUri] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+
+  // Handle image selection
+  const handleSelectImage = () => {
+    launchImageLibrary(
+      {
+        mediaType: 'photo',
+        includeBase64: false,
+      },
+      (response) => {
+        if (response.didCancel) {
+          console.log('User cancelled image picker');
+        } else if (response.errorMessage) {
+          console.log('ImagePicker Error:', response.errorMessage);
+        } else if (response.assets) {
+          const selectedAsset: Asset = response.assets[0];
+          setImageUri(selectedAsset.uri || null);
+        }
+      }
+    );
   };
 
-  const handleLogout = async () => {
-    await apiProvider.logout();
-  };
+  // Handle image upload
+  const handleUploadImage = async () => {
+    if (!imageUri) {
+      Alert.alert('Error', 'Please select an image to upload.');
+      return;
+    }
 
-  const makeProtectedRequest = async () => {
+    setLoading(true);
+
+    // Prepare FormData for image upload
+    const formData = new FormData();
+    formData.append('file', {
+      uri: imageUri,
+      name: 'upload.jpg',
+      type: 'image/jpeg',
+    } as unknown as Blob);
+
     try {
-      const response = await apiProvider.call('get', '/protected-route');
-      setData(response.data)
-      console.log('Protected request response:', response.data);
+      const response = await apiRequest<UploadResponse>('POST', '/upload', formData, true);
+      Alert.alert('Success', response.message);
+      console.log('Upload Response:', response);
     } catch (error) {
-      console.error('Protected request error:', error);
+      console.error('Upload Error:', error.message);
+      Alert.alert('Error', error.message);
+    } finally {
+      setLoading(false);
     }
   };
 
   return (
-    <View>
-      {apiProvider.accessToken ? (
-        <View>
-          <Text>Logged in. Access Token: {apiProvider.accessToken}</Text>
-          <Button title="Logout" onPress={handleLogout} />
-          <Button title="Make Protected Request" onPress={makeProtectedRequest} />
-          {data && <Text>{JSON.stringify(data)}</Text>}
-        </View>
+    <View style={styles.container}>
+      <Text style={styles.header}>Image Upload Example</Text>
+
+      {imageUri && (
+        <Image source={{ uri: imageUri }} style={styles.imagePreview} />
+      )}
+
+      <Button title="Select Image" onPress={handleSelectImage} />
+
+      {loading ? (
+        <ActivityIndicator size="large" color="#0000ff" />
       ) : (
-        <Button title="Login" onPress={handleLogin} />
+        <Button title="Upload Image" onPress={handleUploadImage} />
       )}
     </View>
   );
 };
 
-export default MyComponent;
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    padding: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  header: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 16,
+  },
+  imagePreview: {
+    width: 200,
+    height: 200,
+    marginVertical: 16,
+    borderRadius: 8,
+  },
+});
+
+export default App;
+
