@@ -1,0 +1,279 @@
+import axios, { AxiosInstance, AxiosRequestConfig, AxiosError } from 'axios';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const API_BASE_URL = 'https://your-api-url.com';
+
+// Create Axios instance
+const axiosInstance: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 10000,
+});
+
+// Request Interceptor for Authorization
+axiosInstance.interceptors.request.use(
+  async (config: AxiosRequestConfig) => {
+    const token = await AsyncStorage.getItem('accessToken');
+    if (token) {
+      config.headers = {
+        ...config.headers,
+        Authorization: `Bearer ${token}`,
+      };
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// Response Interceptor for Token Refresh
+axiosInstance.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config;
+
+    if (error.response?.status === 401 && !originalRequest?._retry) {
+      originalRequest._retry = true;
+
+      try {
+        const refreshToken = await AsyncStorage.getItem('refreshToken');
+        if (!refreshToken) throw new Error('Refresh token not found');
+
+        // Request a new access token
+        const response = await axios.post(`${API_BASE_URL}/auth/refresh`, { refreshToken });
+
+        const { accessToken, refreshToken: newRefreshToken } = response.data;
+        await AsyncStorage.setItem('accessToken', accessToken);
+        await AsyncStorage.setItem('refreshToken', newRefreshToken);
+
+        // Retry the original request with the new token
+        originalRequest.headers = {
+          ...originalRequest.headers,
+          Authorization: `Bearer ${accessToken}`,
+        };
+        return axiosInstance(originalRequest);
+      } catch (refreshError) {
+        console.error('Token refresh failed:', refreshError);
+        return Promise.reject(refreshError);
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+export default axiosInstance;
+=====================================================================================
+
+
+
+import { createSlice, createAsyncThunk, PayloadAction } from '@reduxjs/toolkit';
+import axiosInstance from './apiService';
+
+// Thunk for uploading an image
+export const uploadImage = createAsyncThunk<
+  { message: string },
+  FormData,
+  { rejectValue: string }
+>('upload/uploadImage', async (formData, { rejectWithValue }) => {
+  try {
+    const response = await axiosInstance.post('/upload', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+    return response.data;
+  } catch (error: any) {
+    console.error('Upload Error:', error.response?.data || error.message);
+    return rejectWithValue(error.response?.data?.message || 'Failed to upload image.');
+  }
+});
+
+// Thunk for GET request
+export const fetchData = createAsyncThunk<
+  any,
+  string,
+  { rejectValue: string }
+>('upload/fetchData', async (endpoint, { rejectWithValue }) => {
+  try {
+    const response = await axiosInstance.get(endpoint);
+    return response.data;
+  } catch (error: any) {
+    console.error('Fetch Error:', error.response?.data || error.message);
+    return rejectWithValue(error.response?.data?.message || 'Failed to fetch data.');
+  }
+});
+
+// Slice
+interface UploadState {
+  loading: boolean;
+  error: string | null;
+  successMessage: string | null;
+}
+
+const initialState: UploadState = {
+  loading: false,
+  error: null,
+  successMessage: null,
+};
+
+const uploadSlice = createSlice({
+  name: 'upload',
+  initialState,
+  reducers: {
+    resetState: (state) => {
+      state.loading = false;
+      state.error = null;
+      state.successMessage = null;
+    },
+  },
+  extraReducers: (builder) => {
+    builder
+      .addCase(uploadImage.pending, (state) => {
+        state.loading = true;
+        state.error = null;
+        state.successMessage = null;
+      })
+      .addCase(uploadImage.fulfilled, (state, action: PayloadAction<{ message: string }>) => {
+        state.loading = false;
+        state.successMessage = action.payload.message;
+      })
+      .addCase(uploadImage.rejected, (state, action) => {
+        state.loading = false;
+        state.error = action.payload || 'An error occurred.';
+      })
+      .addCase(fetchData.pending, (state) => {
+        state.loading = true;
+        state.error = null;
+      })
+      .addCase(fetchData.fulfilled, (state) => {
+        state.loading = false;
+      })
+      .addCase(fetchData.rejected, (state, action) => {
+        state.loading = false;
+        state.error = action.payload || 'An error occurred.';
+      });
+  },
+});
+
+export const { resetState } = uploadSlice.actions;
+export default uploadSlice.reducer;
+==============================================================================================
+
+
+import React, { useEffect, useState } from 'react';
+import {
+  View,
+  Text,
+  Button,
+  StyleSheet,
+  Image,
+  Alert,
+  ActivityIndicator,
+} from 'react-native';
+import { launchImageLibrary, Asset } from 'react-native-image-picker';
+import { useDispatch, useSelector } from 'react-redux';
+import { uploadImage, resetState, fetchData } from './uploadSlice';
+import { AppDispatch, RootState } from './store';
+
+const App: React.FC = () => {
+  const [imageUri, setImageUri] = useState<string | null>(null);
+
+  const dispatch = useDispatch<AppDispatch>();
+  const { loading, error, successMessage } = useSelector((state: RootState) => state.upload);
+
+  // Handle image selection
+  const handleSelectImage = () => {
+    launchImageLibrary(
+      {
+        mediaType: 'photo',
+        includeBase64: false,
+      },
+      (response) => {
+        if (response.didCancel) {
+          console.log('User cancelled image picker');
+        } else if (response.errorMessage) {
+          console.log('ImagePicker Error:', response.errorMessage);
+        } else if (response.assets) {
+          const selectedAsset: Asset = response.assets[0];
+          setImageUri(selectedAsset.uri || null);
+        }
+      }
+    );
+  };
+
+  // Handle image upload
+  const handleUploadImage = async () => {
+    if (!imageUri) {
+      Alert.alert('Error', 'Please select an image to upload.');
+      return;
+    }
+
+    // Prepare FormData
+    const formData = new FormData();
+    formData.append('file', {
+      uri: imageUri,
+      name: 'upload.jpg',
+      type: 'image/jpeg',
+    } as unknown as Blob);
+
+    dispatch(uploadImage(formData));
+  };
+
+  // Fetch example data
+  const handleFetchData = () => {
+    dispatch(fetchData('/example-endpoint'));
+  };
+
+  // Reset state after success or error
+  useEffect(() => {
+    if (successMessage) {
+      Alert.alert('Success', successMessage);
+      dispatch(resetState());
+    }
+    if (error) {
+      Alert.alert('Error', error);
+      dispatch(resetState());
+    }
+  }, [successMessage, error, dispatch]);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.header}>Image Upload with Redux Toolkit and Interceptor</Text>
+
+      {imageUri && (
+        <Image source={{ uri: imageUri }} style={styles.imagePreview} />
+      )}
+
+      <Button title="Select Image" onPress={handleSelectImage} />
+
+      {loading ? (
+        <ActivityIndicator size="large" color="#0000ff" />
+      ) : (
+        <Button title="Upload Image" onPress={handleUploadImage} />
+      )}
+
+      <Button title="Fetch Data" onPress={handleFetchData} />
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    padding: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  header: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 16,
+  },
+  imagePreview: {
+    width: 200,
+    height: 200,
+    marginVertical: 16,
+    borderRadius: 8,
+  },
+});
+
+export default App;
